@@ -1,140 +1,251 @@
-#!/usr/bin/env python3
-from multiprocessing import Pool
-from pathlib import Path
-import shutil
+#!/usr/bin/env python3.11
+# -*- coding: utf-8 -*-
+'''fireprox - Creates and manages AWS API Gateways to provide proxy URLs to target destinations.
+'''
+import argparse
+import configparser
+import datetime
+import json
+import logging.config
+import logging.handlers
+import os
+import pathlib
+import sys
+
 import tldextract
 import boto3
-import os
-import sys
-import datetime
-import tzlocal
-import argparse
-import json
-import configparser
-from typing import Tuple, Callable
+
+logger = logging.getLogger("fireprox")
+
+AWS_REGIONS = (
+    "us-east-1", "us-east-2","us-west-1","us-west-2","eu-west-3",
+    "ap-northeast-1","ap-northeast-2","ap-south-1",
+    "ap-southeast-1","ap-southeast-2","ca-central-1",
+    "eu-central-1","eu-west-1","eu-west-2","sa-east-1",
+)
 
 
-class FireProx(object):
-    def __init__(self, arguments: argparse.Namespace, help_text: str):
-        self.profile_name = arguments.profile_name
-        self.access_key = arguments.access_key
-        self.secret_access_key = arguments.secret_access_key
-        self.session_token = arguments.session_token
-        self.region = arguments.region
-        self.command = arguments.command
-        self.api_id = arguments.api_id
-        self.url = arguments.url
+class FireProx:
+    '''Consumes parsed arguments, sets up AWS client session, and exposes command functions.
+
+    Args:
+        All attributes
+
+    Attributes:
+        aws_profile: AWS Profile name
+        aws_access_key_id: AWS Access Key ID
+        aws_secret_access_key: AWS Secret Access Key
+        aws_session_token: AWS Session Token
+        use_env_vars: Toggle accessing the standard environment vars for AWS API credentials
+        use_instance_profile: Toggle using the instance profile attached to an EC2 instance
+        aws_region_name: AWS Region name
+        command: create, list, update, or delete
+        target_url: Target URL with full scheme
+        api_gateway_id: ID retrieved using list command
+    
+    Methods:
+        _try_instance_profile: Attempt to create client using EC2 instance profile
+        _load_creds: Establish a boto3 client using one of several methods
+        _create_deployment: Create new API Gateway instance
+        _get_resource: Retrieve existing API Gateway instance by ID
+        _get_integration: Retrieve existing API Gateway integration details by ID
+        _get_template: Generate template for API Gateway integration
+        create_api: Create a new API Gateway instance in the chosen AWS region using the inline template.
+        update_api: Update an existing API Gateway instance with a new target URL.
+        list_api: Get all API Gateway instances in the chosen AWS region.
+        delete_api: Delete an existing API Gateway instance.
+    '''
+    def __init__(
+            self,
+            aws_profile: str = None,
+            aws_access_key_id: str = None,
+            aws_secret_access_key: str = None,
+            aws_session_token: str = None,
+            use_env_vars: bool = False,
+            use_instance_profile: bool = False,
+            aws_region_name: str = None,
+            command: str = None,
+            target_url: str = None,
+            api_gateway_id: str = None,
+        ):
+        self.aws_profile: str = aws_profile
+        self.aws_access_key_id: str = aws_access_key_id
+        self.aws_secret_access_key: str = aws_secret_access_key
+        self.aws_session_token: str = aws_session_token
+        self.use_env_vars: bool = use_env_vars
+        self.use_instance_profile: bool = use_instance_profile
+        self.aws_region_name: str = aws_region_name
+        self._target_url: str = target_url
+        self._api_gateway_id: str = api_gateway_id
+
+        self.command: str = command
+
+        if not (aws_profile or aws_access_key_id or use_env_vars or use_instance_profile):
+            logger.error("No authentication method supplied for FireProx.")
+            raise SystemExit
+
+        if aws_access_key_id and not (aws_secret_access_key and aws_region_name):
+            logger.error(
+                "AWS API Access Key ID supplied but no Secret Access Key and/or AWS Region supplied."
+            )
+            raise SystemExit
+
+        if not aws_profile and aws_region_name not in AWS_REGIONS:
+            logger.error("The supplied AWS region %s does not match the known list: %s", aws_region_name, AWS_REGIONS)
+            raise SystemExit
+
         self.api_list = []
         self.client = None
-        self.help = help_text
 
-        if self.access_key and self.secret_access_key:
-            if not self.region:
-                self.error('Please provide a region with AWS credentials')
+        self._load_creds()
 
-        if not self.load_creds():
-            self.error('Unable to load AWS credentials')
 
-        if not self.command:
-            self.error('Please provide a valid command')
-
-    def __str__(self):
-        return 'FireProx()'
-
-    def _try_instance_profile(self) -> bool:
-        """Try instance profile credentials
-
-        :return:
-        """
+    def _try_instance_profile(self) -> callable:
         try:
-            if not self.region:
-                self.client = boto3.client('apigateway')
+            if not self.aws_region_name:
+                client = boto3.client("apigateway")
+                self.aws_region_name = self.client.meta.region_name
             else:
-                self.client = boto3.client(
-                    'apigateway',
-                    region_name=self.region
+                client = boto3.client(
+                    "apigateway",
+                    region_name=self.aws_region_name
                 )
-            self.client.get_account()
-            self.region = self.client._client_config.region_name
-            return True
+            client.get_account()
+            return client
         except:
-            return False
+            logger.error("Unhandled exception occurred when trying to use instance profile", exc_info=sys.exc_info())
+            raise
 
-    def load_creds(self) -> bool:
-        """Load credentials from AWS config and credentials files if present.
+    def _load_creds(self) -> callable:
+        if self.use_instance_profile:
+            logger.debug("Using instance profile for FireProx.")
+            self.client = self._try_instance_profile()
+            return
 
-        :return:
-        """
-        # If no access_key, secret_key, or profile name provided, try instance credentials
-        if not any([self.access_key, self.secret_access_key, self.profile_name]):
-            return self._try_instance_profile()
-        # Read in AWS config/credentials files if they exist
-        credentials = configparser.ConfigParser()
-        credentials.read(os.path.expanduser('~/.aws/credentials'))
-        config = configparser.ConfigParser()
-        config.read(os.path.expanduser('~/.aws/config'))
-        # If profile in files, try it, but flow through if it does not work
-        config_profile_section = f'profile {self.profile_name}'
-        if self.profile_name in credentials:
-            if config_profile_section not in config:
-                print(f'Please create a section for {self.profile_name} in your ~/.aws/config file')
-                return False
-            self.region = config[config_profile_section].get('region', 'us-east-1')
+        if self.aws_profile:
+            credentials_from_file = configparser.ConfigParser()
+            credentials_from_file.read(os.path.expanduser("~/.aws/credentials"))
+            config_from_file = configparser.ConfigParser()
+            config_from_file.read(os.path.expanduser("~/.aws/config"))
+
+            config_profile_section = f"profile {self.aws_profile}"
+            if config_profile_section not in config_from_file:
+                logger.error("Please add a profile for %s in ~/.aws/config", self.aws_profile)
+                raise SystemExit
+
+            if not self.aws_region_name:
+                self.aws_region_name = config_from_file[config_profile_section].get("region", "us-east-1")
+
+            if self.aws_profile in credentials_from_file:
+                try:
+                    self.client = boto3.session.Session(
+                        profile_name=self.aws_profile,
+                        region_name=self.aws_region_name,
+                    ).client('apigateway')
+                    self.client.get_account()
+                    logger.debug("Using AWS API profile for FireProx.")
+                    return
+                except:
+                    logger.error(
+                        "Unhandled exception occurred when trying to use profile from file",
+                        exc_info=sys.exc_info()
+                    )
+                    raise
+
+        if self.aws_access_key_id:
             try:
-                self.client = boto3.session.Session(profile_name=self.profile_name,
-                        region_name=self.region).client('apigateway')
+                client_kwargs = {
+                    "aws_access_key_id": self.aws_access_key_id,
+                    "aws_secret_access_key": self.aws_secret_access_key,
+                    "region_name": self.aws_region_name,
+                }
+                if self.aws_session_token:
+                    client_kwargs["aws_session_token"] = self.aws_session_token
+                self.client = boto3.client(
+                    'apigateway',
+                    **client_kwargs,
+                )
                 self.client.get_account()
-                return True
+                logger.debug("Using AWS API keys for FireProx.")
+                return
             except:
-                pass
-        # Maybe had profile, maybe didn't
-        if self.access_key and self.secret_access_key:
+                logger.error(
+                        "Unhandled exception occurred when trying to use API keys",
+                        exc_info=sys.exc_info()
+                    )
+                raise
+
+        if self.use_env_vars:
+            try:
+                client_kwargs = {
+                    "aws_access_key_id": os.environ["AWS_ACCESS_KEY_ID"],
+                    "aws_secret_access_key": os.environ["AWS_SECRET_ACCESS_KEY"],
+                    "region_name": os.environ["AWS_DEFAULT_REGION"],
+                }
+                if os.environ.get("AWS_SESSION_TOKEN", None):
+                    client_kwargs["aws_session_token"] = self.aws_session_token
+            except KeyError as e:
+                logger.error("Could not access required environment variables: %s", e.args[0])
+                raise SystemExit  # pylint: disable=W0707
+
             try:
                 self.client = boto3.client(
                     'apigateway',
-                    aws_access_key_id=self.access_key,
-                    aws_secret_access_key=self.secret_access_key,
-                    aws_session_token=self.session_token,
-                    region_name=self.region
+                    **client_kwargs,
                 )
                 self.client.get_account()
-                self.region = self.client._client_config.region_name
-                # Save/overwrite config if profile specified
-                if self.profile_name:
-                    if config_profile_section not in config:
-                        config.add_section(config_profile_section)
-                    config[config_profile_section]['region'] = self.region
-                    with open(os.path.expanduser('~/.aws/config'), 'w') as file:
-                        config.write(file)
-                    if self.profile_name not in credentials:
-                        credentials.add_section(self.profile_name)
-                    credentials[self.profile_name]['aws_access_key_id'] = self.access_key
-                    credentials[self.profile_name]['aws_secret_access_key'] = self.secret_access_key
-                    if self.session_token:
-                        credentials[self.profile_name]['aws_session_token'] = self.session_token
-                    else:
-                        credentials.remove_option(self.profile_name, 'aws_session_token')
-                    with open(os.path.expanduser('~/.aws/credentials'), 'w') as file:
-                        credentials.write(file)
-                return True
+                logger.debug("Using AWS API keys from environment variables for FireProx.")
+                return
             except:
-                return False
-        else:
-            return False
+                logger.error(
+                        "Unhandled exception occurred when trying to use API keys",
+                        exc_info=sys.exc_info()
+                    )
+                raise
 
-    def error(self, error):
-        print(self.help)
-        sys.exit(error)
+        logger.error("No AWS authentication method supplied.")
+        logger.error(self.__dict__)
+        raise SystemExit
 
-    def get_template(self):
-        url = self.url
-        if url[-1] == '/':
-            url = url[:-1]
 
-        title = 'fireprox_{}'.format(
-            tldextract.extract(url).domain
+    def _create_deployment(self, api_id: str) -> str:
+        # You need to include the stage in order to invoke the API.
+        # AWS is dumb.
+        # https://docs.aws.amazon.com/apigateway/latest/developerguide/rest-api-publish.html
+        self.client.create_deployment(
+            restApiId=api_id,
+            stageName="fireprox",
+            stageDescription='FireProx Prod',
+            description='FireProx Production Deployment'
         )
-        version_date = f'{datetime.datetime.now():%Y-%m-%dT%XZ}'
+        return f'https://{api_id}.execute-api.{self.aws_region_name}.amazonaws.com/fireprox/'
+
+
+    def _get_resource(self, api_id: str) -> str:
+        try:
+            response = self.client.get_resources(restApiId=api_id)
+        except self.client.exceptions.NotFoundException:
+            logger.error("The supplied API Gateway ID %s does not match any existing instance", api_id)
+            raise SystemExit  # pylint: disable=W0707
+
+        return [api["id"] for api in response['items'] if api["path"] == "/{proxy+}"].pop()
+
+
+    def _get_integration(self, api_id: str) -> str:
+        resource_id = self._get_resource(api_id)
+        response = self.client.get_integration(
+            restApiId=api_id,
+            resourceId=resource_id,
+            httpMethod="ANY"
+        )
+        return response["uri"]
+
+
+    def _get_template(self, target_url: str) -> str:
+        url = target_url[:-1] if target_url[-1] == '/' else target_url
+
+        title = f"fireprox_{tldextract.extract(url).domain}"
+        version_date = f"{datetime.datetime.now().strftime('%Y-%m-%dT%XZ')}"
         template = '''
         {
           "swagger": "2.0",
@@ -161,6 +272,18 @@ class FireProx(object):
                     "in": "header",
                     "required": false,
                     "type": "string"
+                  },
+                  {
+                    "name": "X-My-Authorization",
+                    "in": "header",
+                    "required": false,
+                    "type": "string"
+                  },
+                  {
+                    "name" : "X-My-X-Amzn-Trace-Id",
+                    "in" : "header",
+                    "required" : false,
+                    "type" : "string"
                   }
                 ],
                 "responses": {},
@@ -173,7 +296,9 @@ class FireProx(object):
                   },
                   "requestParameters": {
                     "integration.request.path.proxy": "method.request.path.proxy",
-                    "integration.request.header.X-Forwarded-For": "method.request.header.X-My-X-Forwarded-For"
+                    "integration.request.header.X-Forwarded-For": "method.request.header.X-My-X-Forwarded-For",
+                    "integration.request.header.Authorization" : "method.request.header.X-My-Authorization",
+                    "integration.request.header.X-Amzn-Trace-Id" : "method.request.header.X-My-X-Amzn-Trace-Id"
                   },
                   "passthroughBehavior": "when_no_match",
                   "httpMethod": "ANY",
@@ -202,6 +327,18 @@ class FireProx(object):
                     "in": "header",
                     "required": false,
                     "type": "string"
+                  },
+                  {
+                    "name": "X-My-Authorization",
+                    "in": "header",
+                    "required": false,
+                    "type": "string"
+                  },
+                  {
+                    "name" : "X-My-X-Amzn-Trace-Id",
+                    "in" : "header",
+                    "required" : false,
+                    "type" : "string"
                   }
                 ],
                 "responses": {},
@@ -214,7 +351,9 @@ class FireProx(object):
                   },
                   "requestParameters": {
                     "integration.request.path.proxy": "method.request.path.proxy",
-                    "integration.request.header.X-Forwarded-For": "method.request.header.X-My-X-Forwarded-For"
+                    "integration.request.header.X-Forwarded-For": "method.request.header.X-My-X-Forwarded-For",
+                    "integration.request.header.Authorization": "method.request.header.X-My-Authorization",
+                    "integration.request.header.X-Amzn-Trace-Id": "method.request.header.X-My-X-Amzn-Trace-Id"
                   },
                   "passthroughBehavior": "when_no_match",
                   "httpMethod": "ANY",
@@ -229,190 +368,275 @@ class FireProx(object):
           }
         }
         '''
-        template = template.replace('{{url}}', url)
-        template = template.replace('{{title}}', title)
-        template = template.replace('{{version_date}}', version_date)
+        template = template.replace("{{url}}", url)
+        template = template.replace("{{title}}", title)
+        template = template.replace("{{version_date}}", version_date)
 
         return str.encode(template)
 
-    def create_api(self, url):
-        if not url:
-            self.error('Please provide a valid URL end-point')
 
-        print(f'Creating => {url}...')
+    def create_api(self, target_url: str):
+        '''Create a new API Gateway instance in the chosen AWS region using the inline template.
 
-        template = self.get_template()
+        Args:
+            self: Self@FireProx
+        
+        Return:
+            (proxyl_url, api_id)
+        '''
+        logger.debug("Using %s as target URL for creation", target_url)
+
+        template = self._get_template(target_url)
         response = self.client.import_rest_api(
             parameters={
-                'endpointConfigurationTypes': 'REGIONAL'
+                "endpointConfigurationTypes": "REGIONAL"
             },
             body=template
         )
-        resource_id, proxy_url = self.create_deployment(response['id'])
-        self.store_api(
-            response['id'],
-            response['name'],
-            response['createdDate'],
-            response['version'],
-            url,
-            resource_id,
-            proxy_url
+        api_id = response["id"]
+        proxy_url = self._create_deployment(api_id)
+        logger.info("(%s) %s => %s (%s)", api_id, response["name"], proxy_url, target_url)
+        return proxy_url, api_id
+
+
+    def update_api(self, target_url: str, api_gateway_id: str):
+        '''Update an existing API Gateway instance with a new target URL.
+
+        Args:
+            self: Self@FireProx
+        
+        Return:
+            None
+        '''
+        logger.debug("Updating API %s with new target URL %s", api_gateway_id, target_url)
+        new_url = target_url[:-1] if target_url[-1] == '/' else target_url
+
+        resource_id = self._get_resource(api_gateway_id)
+
+        if not resource_id:
+            logger.error("Unable to update, no valid resource for %s", api_gateway_id)
+            raise SystemExit
+
+        logger.info("Found resource %s for %s", resource_id, api_gateway_id)
+        self.client.update_integration(
+            restApiId=api_gateway_id,
+            resourceId=resource_id,
+            httpMethod='ANY',
+            patchOperations=[
+                {
+                    "op": "replace",
+                    "path": "/uri",
+                    "value": f"{new_url}/{{proxy}}",
+                },
+            ]
         )
+        logger.info("Updated %s with new target URL %s", api_gateway_id, target_url)
 
-    def update_api(self, api_id, url):
-        if not any([api_id, url]):
-            self.error('Please provide a valid API ID and URL end-point')
 
-        if url[-1] == '/':
-            url = url[:-1]
+    def list_api(self, results: bool = False) -> None | list:
+        '''Get all API Gateway instances in the chosen AWS region.
+        Set results to True to get a raw list from the AWS API.
 
-        resource_id = self.get_resource(api_id)
-        if resource_id:
-            print(f'Found resource {resource_id} for {api_id}!')
-            response = self.client.update_integration(
-                restApiId=api_id,
-                resourceId=resource_id,
-                httpMethod='ANY',
-                patchOperations=[
-                    {
-                        'op': 'replace',
-                        'path': '/uri',
-                        'value': '{}/{}'.format(url, r'{proxy}'),
-                    },
-                ]
-            )
-            return response['uri'].replace('/{proxy}', '') == url
-        else:
-            self.error(f'Unable to update, no valid resource for {api_id}')
+        Args:
+            self: Self@FireProx
 
-    def delete_api(self, api_id):
-        if not api_id:
-            self.error('Please provide a valid API ID')
-        items = self.list_api(api_id)
-        for item in items:
-            item_api_id = item['id']
-            if item_api_id == api_id:
-                response = self.client.delete_rest_api(
-                    restApiId=api_id
-                )
-                return True
-        return False
-
-    def list_api(self, deleted_api_id=None):
+        Returns:
+            None if results is False
+            list
+        '''
         response = self.client.get_rest_apis()
-        for item in response['items']:
+        if results:
+            return response["items"]
+        for api in response["items"]:
             try:
-                created_dt = item['createdDate']
-                api_id = item['id']
-                name = item['name']
-                proxy_url = self.get_integration(api_id).replace('{proxy}', '')
-                url = f'https://{api_id}.execute-api.{self.region}.amazonaws.com/fireprox/'
-                if not api_id == deleted_api_id:
-                    print(f'[{created_dt}] ({api_id}) {name}: {url} => {proxy_url}')
+                api_id = api["id"]
+                name = api["name"]
+                proxy_url = self._get_integration(api_id).replace("{proxy}", "")
+                url = f'https://{api_id}.execute-api.{self.aws_region_name}.amazonaws.com/fireprox/'
+                logger.info("(%s) %s: %s => %s", api_id, name, url, proxy_url)
             except:
-                pass
-
-        return response['items']
-
-    def store_api(self, api_id, name, created_dt, version_dt, url,
-                  resource_id, proxy_url):
-        print(
-            f'[{created_dt}] ({api_id}) {name} => {proxy_url} ({url})'
-        )
-
-    def create_deployment(self, api_id):
-        if not api_id:
-            self.error('Please provide a valid API ID')
-
-        response = self.client.create_deployment(
-            restApiId=api_id,
-            stageName='fireprox',
-            stageDescription='FireProx Prod',
-            description='FireProx Production Deployment'
-        )
-        resource_id = response['id']
-        return (resource_id,
-                f'https://{api_id}.execute-api.{self.region}.amazonaws.com/fireprox/')
-
-    def get_resource(self, api_id):
-        if not api_id:
-            self.error('Please provide a valid API ID')
-        response = self.client.get_resources(restApiId=api_id)
-        items = response['items']
-        for item in items:
-            item_id = item['id']
-            item_path = item['path']
-            if item_path == '/{proxy+}':
-                return item_id
+                logger.error(
+                        "Unhandled exception occurred when listing API Gateways",
+                        exc_info=sys.exc_info()
+                    )
+                raise
+        logger.info("Total API Gateways retrieved from %s: %s", self.aws_region_name, len(response['items']))
         return None
 
-    def get_integration(self, api_id):
-        if not api_id:
-            self.error('Please provide a valid API ID')
-        resource_id = self.get_resource(api_id)
-        response = self.client.get_integration(
-            restApiId=api_id,
-            resourceId=resource_id,
-            httpMethod='ANY'
-        )
-        return response['uri']
+
+    def delete_api(self, api_gateway_id: str):
+        '''Delete an existing API Gateway instance.
+
+        Args:
+            self: Self@FireProx
+
+        Returns:
+            None
+        '''
+        logger.debug("Deleting API with ID: %s", api_gateway_id)
+        try:
+            self.client.delete_rest_api(restApiId=api_gateway_id)
+            logger.info("Deleted %s", api_gateway_id)
+        except self.client.exceptions.NotFoundException:
+            logger.error("The supplied API Gateway ID %s does not match any existing instance", api_gateway_id)
+            raise SystemExit  # pylint: disable=W0707
 
 
-def parse_arguments() -> Tuple[argparse.Namespace, str]:
-    """Parse command line arguments and return namespace
+def setup_logging(config_path: str = "logging_config.json"):
+    '''Consumes the file at config_path (assumes json) and loads as the logger configuration.
 
-    :return: Namespace for arguments and help text as a tuple
-    """
-    parser = argparse.ArgumentParser(description='FireProx API Gateway Manager')
-    parser.add_argument('--profile_name',
-                        help='AWS Profile Name to store/retrieve credentials', type=str, default=None)
-    parser.add_argument('--access_key',
-                        help='AWS Access Key', type=str, default=None)
-    parser.add_argument('--secret_access_key',
-                        help='AWS Secret Access Key', type=str, default=None)
-    parser.add_argument('--session_token',
-                        help='AWS Session Token', type=str, default=None)
-    parser.add_argument('--region',
-                        help='AWS Region', type=str, default=None)
-    parser.add_argument('--command',
-                        help='Commands: list, create, delete, update', type=str, default=None)
-    parser.add_argument('--api_id',
-                        help='API ID', type=str, required=False)
-    parser.add_argument('--url',
-                        help='URL end-point', type=str, required=False)
-    return parser.parse_args(), parser.format_help()
+    Args:
+        config_path: Absolute or relative path to config file.
+
+    Returns:
+        None
+    '''
+    config_file = pathlib.Path(config_path)
+    with open(config_file, encoding="utf-8") as f_in:
+        logging_config: dict = json.load(f_in)
+    logging.config.dictConfig(config=logging_config)
+
+
+def parse_arguments() -> argparse.Namespace:
+    '''Parse command line arguments and return
+
+    Args:
+        None
+    
+    Returns:
+        argparse.Namespace
+    '''
+    parser = argparse.ArgumentParser(
+        prog="FireProx",
+        description="FireProx API Gateway Manager",
+    )
+
+    auth_group = parser.add_mutually_exclusive_group(required=True)
+
+    auth_group.add_argument(
+        "--aws-profile",
+        type=str,
+        metavar="PROFILE NAME",
+        dest="aws_profile",
+        default=None,
+    )
+
+    auth_group.add_argument(
+        "--aws-access-key-id",
+        type=str,
+        dest="aws_access_key_id",
+        default=None,
+    )
+
+    auth_group.add_argument(
+        "--use-env-vars",
+        action='store_true',
+        dest="use_env_vars",
+        default=None,
+    )
+
+    auth_group.add_argument(
+        "--use-instance-profile",
+        action='store_true',
+        dest="use_instance_profile",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--aws-secret-access-key",
+        type=str,
+        dest="aws_secret_access_key",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--aws-session-token",
+        type=str,
+        dest="aws_session_token",
+        default=None,
+    )
+
+    parser.add_argument(
+        "--aws-region-name",
+        type=str,
+        dest="aws_region_name",
+        default=None,
+    )
+
+    command_subparser = parser.add_subparsers(dest="command")
+
+    command_subparser.add_parser("list")
+
+    create_subcommand = command_subparser.add_parser("create")
+    create_subcommand.add_argument(
+        "--target-url",
+        type=str,
+        required=True,
+        dest="target_url",
+    )
+
+    update_subcommand = command_subparser.add_parser("update")
+    update_subcommand.add_argument(
+        "--api-gateway-id",
+        type=str,
+        required=True,
+        dest="api_gateway_id",
+    )
+    update_subcommand.add_argument(
+        "--target-url",
+        type=str,
+        required=True,
+        dest="target_url",
+    )
+
+    delete_subcommand = command_subparser.add_parser("delete")
+    delete_subcommand.add_argument(
+        "--api-gateway-id",
+        type=str,
+        required=True,
+        dest="api_gateway_id",
+    )
+
+    return parser.parse_args()
 
 
 def main():
-    """Run the main program
+    '''Parse arguments and execute desired command.
 
-    :return:
-    """
-    args, help_text = parse_arguments()
-    fp = FireProx(args, help_text)
-    if args.command == 'list':
-        print(f'Listing API\'s...')
-        result = fp.list_api()
+    Args:
+        None
 
-    elif args.command == 'create':
-        result = fp.create_api(fp.url)
+    Returns:
+        None
+    '''
 
-    elif args.command == 'delete':
-        result = fp.delete_api(fp.api_id)
-        success = 'Success!' if result else 'Failed!'
-        print(f'Deleting {fp.api_id} => {success}')
+    args = parse_arguments()
 
-    elif args.command == 'update':
-        print(f'Updating {fp.api_id} => {fp.url}...')
-        result = fp.update_api(fp.api_id, fp.url)
-        success = 'Success!' if result else 'Failed!'
-        print(f'API Update Complete: {success}')
+    if not args.aws_access_key_id and (args.aws_secret_access_key or args.aws_session_token):
+        logger.warning(
+            "AWS Secret Acccess Key and/or Session Token supplied with alternative authentication method. "
+            "The secret key and token will be ignored."
+        )
 
-    else:
-        print(f'[ERROR] Unsupported command: {args.command}\n')
-        print(help_text)
-        sys.exit(1)
+    logger.debug("Successfully parsed arguments", extra=vars(args))
+
+    if not args.command:
+        logger.error("No command supplied.")
+        raise SystemExit
+
+    fp = FireProx(**vars(args))
+
+    match fp.command:
+        case "list":
+            fp.list_api()
+        case "create":
+            fp.create_api(target_url=args.target_url)
+        case "delete":
+            fp.delete_api(api_gateway_id=args.api_gateway_id)
+        case "update":
+            fp.update_api(target_url=args.target_url, api_gateway_id=args.api_gateway_id)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
+    setup_logging()
     main()
